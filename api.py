@@ -1,10 +1,13 @@
-import inspect
 import collections
+import inspect
+import six
+import sys
 
 import numpy as np
 import paddle
 import paddle.fluid as fluid
-from paddle.fluid.layers.utils import map_structure, flatten
+import paddle.fluid.layers.utils as utils
+from paddle.fluid.layers.utils import map_structure, flatten, pack_sequence_as
 from paddle.fluid.dygraph import to_variable
 
 
@@ -14,10 +17,13 @@ class Model(fluid.dygraph.Layer):
     """
     def __init__(self, **kwargs):
         super(Model, self).__init__("model")
-        self._dygraph_mode = True
+        self._dygraph_mode = False
 
         # extract data desc from method arguments
         self._data_descs = {}
+        is_sequence_ori = utils.is_sequence
+        # nested structure of shapes
+        utils.is_sequence = self._InputDesc._is_shape_sequence
         for func in [self.forward, self.loss]:
             func_argspec = inspect.getargspec(func)
             for i, arg in enumerate(func_argspec.args[::-1]):
@@ -25,11 +31,43 @@ class Model(fluid.dygraph.Layer):
                     assert i <= len(
                         func_argspec.defaults
                     ), "The shape argument must have default value."
-                    self._data_descs[arg[:-len("_shape")]] = self.InputDesc(
+                    self._data_descs[arg[:-len("_shape")]] = map_structure(
+                        lambda shape: self._InputDesc(shape),
                         func_argspec.defaults[-i - 1])
+        utils.is_sequence = is_sequence_ori
+        print(self._data_descs)
 
-    class InputDesc(collections.namedtuple("InputDesc", ("shape", ))):
-        pass
+
+        # self._optimizer = kwargs.get()
+        # TODO: mutable program
+        # self._cache_programs = {}
+
+    class _InputDesc(object):
+        def __init__(self, shape):
+            self.shape = shape
+
+        @staticmethod
+        def _is_shape_sequence(seq):
+            if sys.version_info < (3, ):
+                integer_types = (int, long)
+            else:
+                integer_types = (int, )
+            if (isinstance(seq, list) or isinstance(seq, tuple)):
+                if reduce(
+                        lambda flag, x:
+                    (x is None or isinstance(x, integer_types)) and flag, seq,
+                        True):
+                    return False
+            if isinstance(seq, dict):
+                return True
+            return (isinstance(seq, collections.Sequence)
+                    and not isinstance(seq, six.string_types))
+
+        def __str__(self):
+            return self.__repr__()
+
+        def __repr__(self):
+            return "shape: {}".format(self.shape)
 
     def __call__(self, *args, **kwargs):
         return self.predict(*args, **kwargs)
@@ -46,11 +84,10 @@ class Model(fluid.dygraph.Layer):
     def _make_sequential_function(self, functions, for_test, *args, **kwargs):
         # TODO: add customed output to fetch
 
-        model_class_self = self
+        model_self = self
 
-        class _DygraphCallFunctor(object):
-            def __init__(self, functions, for_test, *args,
-                         **kwargs):
+        class _DygraphCaller(object):
+            def __init__(self, functions, for_test, *args, **kwargs):
                 self._functions = functions
                 self._for_test = for_test
 
@@ -61,28 +98,41 @@ class Model(fluid.dygraph.Layer):
 
             def _convert_args(self, function, args, kwargs):
                 function_argspec = inspect.getargspec(function)
+                function_argspec_args = function_argspec.args
+                if inspect.ismethod(function):
+                    # exclude implicit 'self' or 'cls' argument
+                    function_argspec_args = function_argspec_args[1:]
                 function_kwargs = {}
-                end_idx = len(function_argspec.args)
-                # truncate args from the first keyword argument, otherwise
-                # TypeError: got multiple values for keyword argument
-                for arg_idx, arg in enumerate(function_argspec.args):
+                end_idx = len(function_argspec_args)
+                # convert named arguments
+                for arg_idx, arg in enumerate(function_argspec_args):
                     if kwargs.has_key(arg):
-                        end_idx = arg_idx
+                        if end_idx == len(function_argspec_args):
+                            # truncate args from the first keyword argument
+                            end_idx = arg_idx
                         function_kwargs[arg] = self._convert_input(
                             kwargs.pop(arg))
+                # convert defaults
+                # It is ambiguous to split args if args has default values.
+                # Use defaults only for args after the first named argument,
+                # while args before the first named argument should also be
+                # able to use defaults.
+                if function_argspec.defaults:
+                    for arg_idx, arg in enumerate(
+                            function_argspec_args[end_idx:][::-1]):
+                        if not function_kwargs.has_key(arg):
+                            function_kwargs[arg] = self._convert_input(
+                                function_argspec.defaults[-arg_idx - 1])
+                    end_idx -= len(function_argspec.defaults)
+                # convert positional arguments
                 function_args = [self._convert_input(x) for x in args[:end_idx]]
                 return function_args, function_kwargs, args[end_idx:], kwargs
 
             def __call__(self, *args, **kwargs):
                 for function in self._functions:
-                    # print(function)
-                    # print(args)
-                    # print(kwargs)
                     (function_args, function_kwargs, remain_args,
                      remain_kwargs) = self._convert_args(
                          function, args, kwargs)
-                    # print(function_args)
-                    # print(function_kwargs)
                     function_outs = function(*function_args, **function_kwargs)
                     args = list(function_outs if isinstance(
                         function_outs, collections.Sequence
@@ -90,7 +140,7 @@ class Model(fluid.dygraph.Layer):
                     kwargs = remain_kwargs
                 return function_outs
 
-        class _GraphCallFunctor(object):
+        class _GraphCaller(object):
             def __init__(self, functions, for_test, *args, **kwargs):
                 self._functions = functions
                 self._for_test = for_test
@@ -129,36 +179,117 @@ class Model(fluid.dygraph.Layer):
                         self._executor.run(self._startup_program)
                         break
 
-            def _convert_input(self, input):
-                model_class_self._data_descs
-                return map_structure(
-                    lambda x: to_variable(x)
-                    if isinstance(x, np.ndarray) else x, input)
+            def _convert_input(self,
+                               input,
+                               input_name,
+                               input_idx,
+                               is_default=False):
+                def _to_variable(x, x_desc=None, x_name=None, x_idx=None):
+                    if isinstance(x, np.ndarray):
+                        out = fluid.data(name=x_name if x_idx is None else
+                                         (x_name + "_" + str(x_idx)),
+                                         shape=([None] + list(x.shape[1:]))
+                                         if x_desc is None else x_desc.shape,
+                                         dtype=x.dtype)
+                        # set the way to get input data, then we can use it to
+                        # extract data from args and kwargs when running __call__
+                        if is_default:  # for defaults
+                            if x_idx is None:  # if input is plain
+                                data_extracter = lambda args, kwargs: input
+                            else:  #  if input is nested structure
+                                data_extracter = lambda args, kwargs: flatten(
+                                    input)[x_idx]
+                        elif input_idx is None:  # for named arg
+                            if x_idx is None:  # if input is plain
+                                data_extracter = lambda args, kwargs: kwargs[
+                                    input_name]
+                            else:  #  if input is nested structure
+                                data_extracter = lambda args, kwargs: flatten(
+                                    kwargs[input_name])[x_idx]
+                        else:  # for positional arg
+                            if x_idx is None:  # if input is plain
+                                data_extracter = lambda args, kwargs: args[
+                                    input_idx]
+                            else:  #  if input is nested structure
+                                data_extracter = lambda args, kwargs: flatten(
+                                    args[input_idx])[x_idx]
+                        self._inputs[out.name] = data_extracter
+                    else:
+                        out = x
+                    return out
+
+                input_desc = model_self._data_descs.get(input_name, None)
+                if not utils.is_sequence(input):
+                    return _to_variable(input, input_desc, input_name)
+                flat_output = []
+                if input_desc is None:
+                    for i, x in enumerate(flatten(input)):
+                        out = _to_variable(x, x_name=input_name, x_idx=i)
+                        flat_output.append(out)
+                else:
+                    for i, x in enumerate(
+                            zip(flatten(input), flatten(input_desc))):
+                        out = _to_variable(*x, x_name=input_name, x_idx=i)
+                        flat_output.append(out)
+                output = pack_sequence_as(input, flat_output)
+                return output
 
             def _convert_args(self, function, args, kwargs):
+                # print(inspect.getcallargs(function, *args, **kwargs))
                 function_argspec = inspect.getargspec(function)
+                function_argspec_args = function_argspec.args
+                if inspect.ismethod(function):
+                    # exclude implicit 'self' or 'cls' argument
+                    function_argspec_args = function_argspec_args[1:]
                 function_kwargs = {}
-                end_idx = len(function_argspec.args)
-                # truncate args from the first keyword argument, otherwise
-                # TypeError: got multiple values for keyword argument
-                for arg_idx, arg in enumerate(function_argspec.args):
+                end_idx = len(function_argspec_args)
+                # convert named arguments
+                for arg_idx, arg in enumerate(function_argspec_args):
                     if kwargs.has_key(arg):
-                        end_idx = arg_idx
+                        if end_idx == len(function_argspec_args):
+                            # truncate args from the first keyword argument
+                            end_idx = arg_idx
                         function_kwargs[arg] = self._convert_input(
-                            kwargs.pop(arg))
-                function_args = [self._convert_input(x) for x in args[:end_idx]]
+                            kwargs.pop(arg), input_name=arg, input_idx=None)
+                # convert defaults
+                # It is ambiguous to split args if args has default values.
+                # Use defaults only for args after the first named argument,
+                # while args before the first named argument should also be
+                # able to use defaults.
+                if function_argspec.defaults:
+                    for arg_idx, arg in enumerate(
+                            function_argspec_args[end_idx:][::-1]):
+                        if not function_kwargs.has_key(arg):
+                            function_kwargs[arg] = self._convert_input(
+                                function_argspec.defaults[-arg_idx - 1],
+                                input_name=arg,
+                                input_idx=None,
+                                is_default=True)
+                    end_idx -= len(function_argspec.defaults)
+                # convert positional arguments
+                function_args = [  # actually we needn't use arg name as var name
+                    self._convert_input(i, *arg) for i, arg in enumerate(
+                        zip(function_argspec_args[:end_idx], args[:end_idx]))
+                ]
                 return function_args, function_kwargs, args[end_idx:], kwargs
 
             def __call__(self, *args, **kwargs):
-                outputs = self._executor.run(self._main_program,
-                                             feed=self._inputs,
-                                             fetch_list=self._outputs)
+                # since we only run functions one time to build graph,
+                # assume all run has same arg signature with the first run
+                # TODO: check all run has the same arg signature
+                outputs = self._executor.run(
+                    self._main_program,
+                    feed=dict([
+                        (var_name, data_extracter(args, kwargs))
+                        for var_name, data_extracter in self._inputs.items()
+                    ]),
+                    fetch_list=self._outputs)
                 return outputs
 
         if self._dygraph_mode:
-            return _DygraphCallFunctor(functions, for_test, *args, **kwargs)
+            return _DygraphCaller(functions, for_test, *args, **kwargs)
         else:
-            return _GraphCallFunctor(functions, for_test, *args, **kwargs)
+            return _GraphCaller(functions, for_test, *args, **kwargs)
 
     def train(self, *args, **kwargs):
         if not hasattr(self, "_train_function"):
@@ -191,8 +322,12 @@ class MyModel(Model):
         super(MyModel, self).__init__()
         self.fc = fluid.dygraph.FC(name, hidden)
 
-    def forward(self, x, x_shape=[None, 8]):
+    def forward(self, x, y, x_shape=[None, 8]):
         # print("x: ", x)
+        # print("y: ", y)
+        print("x_shape: ", x_shape)
+        x = x + y
+        # print("x+y: ", x)
         x = self.fc(x)
         return x
 
@@ -210,8 +345,11 @@ class MyModel(Model):
 
 with fluid.dygraph.guard():
     my_model = MyModel('myfc', 1)
-    print(my_model(np.random.rand(2, 8).astype("float32")))
+    # print(my_model(
+    #     np.random.rand(2, 8).astype("float32"),
+    #     np.random.rand(2, 8).astype("float32")))
     print(my_model.train(np.random.rand(2, 8).astype("float32"),
+                         np.random.rand(2, 8).astype("float32"),
                          target=np.random.rand(2, 1).astype("float32")))
     # fc = fluid.dygraph.FC("test", 1)
     # pred = fc(to_variable(np.random.rand(2, 8).astype("float32")))
@@ -221,7 +359,15 @@ with fluid.dygraph.guard():
     # optimizer = fluid.optimizer.SGD(learning_rate=0.001)
     # x = optimizer.minimize(loss)
     # print(x)
+print(flatten([np.random.rand(2, 3), np.random.rand(2, 3)]))
+print(map_structure(lambda x: x, np.random.rand(2, 3)))
+print(flatten(Model._InputDesc([None, 1,2,3])))
+print(len(flatten(Model._InputDesc([None, 1, 2, 3]))))
 
+def tmp(a, b=1):pass
+# print(inspect.getargspec(tmp))
+print(map_structure(tmp, [1]))
+print(map_structure(tmp, [1], [1]))
 exit(0)
 
 
