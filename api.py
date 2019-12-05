@@ -17,7 +17,7 @@ class Model(fluid.dygraph.Layer):
     """
     graph: network + loss + optimizer + metric
     """
-    def __init__(self, **kwargs):
+    def __init__(self):
         super(Model, self).__init__("model")
         self._dygraph_mode = is_eager
 
@@ -152,13 +152,16 @@ class Model(fluid.dygraph.Layer):
                 # NOTE: how to run create_parameter multiple times when
                 # build_once would only be called once or parameters are
                 # created in __init__
-                # temporarily, clone parameters form model.parameters to solve
+                # temporarily, clone parameters from model.parameters to solve
                 # if model has been run, parameters would exist
-                # for param in model_self.parameters():
-                #     self._clone_var(self._main_program, param)
-                # if hasattr(model_self, "optimizer"):
-                #     for param in model_self.optimizer.parameters():
-                #         self._clone_var(self._main_program, param)
+                for param in model_self.parameters():
+                    self._clone_var(self._main_program.global_block(), param)
+                if hasattr(model_self,
+                           "optimizer") and (model_self.optim in functions):
+                    for state in model_self.optimizer._accumulators:
+                        # TODO: Add LearningRateDecay
+                        self._clone_var(self._main_program.global_block(),
+                                        state)
 
                 # map var name to how to get corresponding data
                 self._inputs = {}
@@ -179,25 +182,29 @@ class Model(fluid.dygraph.Layer):
                 if for_test:
                     self._main_program = self._main_program.clone(for_test=True)
                 # initialization
+                # NOTE: Do not overwrite loaded parameters, maybe we should
+                # prune the startup program to only include tue uninitialized
+                uninit_params = []
                 for var in self._startup_program.list_vars():
                     var_runtime = fluid.global_scope().find_var(var.name)
-                    # NOTE: Do not overwrite loaded parameters, maybe we should
-                    # prune the startup program to only include tue uninitialized
                     if var_runtime is None or (
                             not var_runtime.get_tensor()._is_initialized()):
-                        print("run initialization")
-                        self._executor.run(self._startup_program)
-                        break
+                        uninit_params.append(var)
+                print("try to run initialization")
+                if uninit_params:
+                    print("run initialization")
+                    init_program = self._startup_program._prune(uninit_params)
+                    self._executor.run(init_program)
 
             @staticmethod
             def _clone_var(block, var):
-                assert isinstance(var, Variable)
+                assert isinstance(var, fluid.Variable)
                 return block.create_var(name=var.name,
                                         shape=var.shape,
                                         dtype=var.dtype,
                                         type=var.type,
                                         lod_level=var.lod_level,
-                                        persistable=True)
+                                        persistable=var.persistable)
 
             def _convert_input(self,
                                input,
@@ -361,7 +368,7 @@ class MyModel(Model):
         return x
 
     def optim(self, loss):
-        optimizer = fluid.optimizer.SGD(learning_rate=0.001)
+        self.optimizer = optimizer = fluid.optimizer.SGD(learning_rate=0.001)
         x = optimizer.minimize(loss)
         return x
 
@@ -375,15 +382,18 @@ def eager_guard(is_eager):
 
 with eager_guard(is_eager):
     my_model = MyModel('myfc', 1)
+    print(my_model(
+        np.random.rand(2, 8).astype("float32"),
+        np.random.rand(2, 8).astype("float32")))
     print(my_model.train(np.random.rand(2, 8).astype("float32"),
                          np.random.rand(2, 8).astype("float32"),
                          target=np.random.rand(2, 1).astype("float32")))
     print(my_model.train(np.random.rand(2, 8).astype("float32"),
                          np.random.rand(2, 8).astype("float32"),
                          target=np.random.rand(2, 1).astype("float32")))
-    # print(my_model(
-    #     np.random.rand(2, 8).astype("float32"),
-    #     np.random.rand(2, 8).astype("float32")))
+    print(my_model(
+        np.random.rand(2, 8).astype("float32"),
+        np.random.rand(2, 8).astype("float32")))
     # fc = fluid.dygraph.FC("test", 1)
     # print("hehehehehehhe", fc.parameters())
     # pred = fc(to_variable(np.random.rand(2, 8).astype("float32")))
