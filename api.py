@@ -27,15 +27,19 @@ class Model(fluid.dygraph.Layer):
         # nested structure of shapes
         utils.is_sequence = self._InputDesc._is_shape_sequence
         for func in [self.forward, self.loss]:
+            flag = True
             func_argspec = inspect.getargspec(func)
             for i, arg in enumerate(func_argspec.args[::-1]):
                 if arg.endswith("_shape"):
+                    assert flag, "_shape arguments must be at the rear."
                     assert i <= len(
                         func_argspec.defaults
                     ), "The shape argument must have default value."
                     self._data_descs[arg[:-len("_shape")]] = map_structure(
                         lambda shape: self._InputDesc(shape),
                         func_argspec.defaults[-i - 1])
+                else:  # switch flag
+                    flag = False
         utils.is_sequence = is_sequence_ori
         print(self._data_descs)
 
@@ -71,6 +75,10 @@ class Model(fluid.dygraph.Layer):
         def __repr__(self):
             return "shape: {}".format(self.shape)
 
+    @classmethod
+    def add_input_desc(cls, func, **kwargs):
+        return func
+
     def __call__(self, *args, **kwargs):
         return self.predict(*args, **kwargs)
 
@@ -104,6 +112,11 @@ class Model(fluid.dygraph.Layer):
                 if inspect.ismethod(function):
                     # exclude implicit 'self' or 'cls' argument
                     function_argspec_args = function_argspec_args[1:]
+                for i, arg in enumerate(function_argspec_args[::-1]):
+                    if not arg.endswith("_shape"):
+                        function_argspec_args = function_argspec_args[:len(
+                            function_argspec_args) - i]
+                        break
                 function_kwargs = {}
                 end_idx = len(function_argspec_args)
                 # convert named arguments
@@ -125,7 +138,6 @@ class Model(fluid.dygraph.Layer):
                         if not function_kwargs.has_key(arg):
                             function_kwargs[arg] = self._convert_input(
                                 function_argspec.defaults[-arg_idx - 1])
-                    end_idx -= len(function_argspec.defaults)
                 # convert positional arguments
                 function_args = [self._convert_input(x) for x in args[:end_idx]]
                 return function_args, function_kwargs, args[end_idx:], kwargs
@@ -151,7 +163,8 @@ class Model(fluid.dygraph.Layer):
                 self._startup_program = fluid.Program()
                 # NOTE: how to run create_parameter multiple times when
                 # build_once would only be called once or parameters are
-                # created in __init__
+                # created in __init__. This is what confronts us when predict
+                # and train both are called.
                 # temporarily, clone parameters from model.parameters to solve
                 # if model has been run, parameters would exist
                 for param in model_self.parameters():
@@ -168,16 +181,20 @@ class Model(fluid.dygraph.Layer):
                 with fluid.program_guard(self._main_program,
                                          self._startup_program):
                     with fluid.unique_name.guard():
+                        arg_offset = 0
                         for function in self._functions:
                             (function_args, function_kwargs, remain_args,
                              remain_kwargs) = self._convert_args(
-                                 function, args, kwargs)
+                                 function, args, kwargs, arg_offset)
                             function_outs = function(*function_args,
                                                      **function_kwargs)
                             args = list(function_outs if isinstance(
                                 function_outs, collections.Sequence
                             ) else [function_outs]) + list(remain_args)
                             kwargs = remain_kwargs
+                            arg_offset = arg_offset + len(function_args) - len(
+                                function_outs) if isinstance(
+                                    function_outs, collections.Sequence) else 1
                 self._outputs = function_outs
                 if for_test:
                     self._main_program = self._main_program.clone(for_test=True)
@@ -261,12 +278,17 @@ class Model(fluid.dygraph.Layer):
                 output = pack_sequence_as(input, flat_output)
                 return output
 
-            def _convert_args(self, function, args, kwargs):
+            def _convert_args(self, function, args, kwargs, arg_offset):
                 function_argspec = inspect.getargspec(function)
                 function_argspec_args = function_argspec.args
                 if inspect.ismethod(function):
                     # exclude implicit 'self' or 'cls' argument
                     function_argspec_args = function_argspec_args[1:]
+                for i, arg in enumerate(function_argspec_args[::-1]):
+                    if not arg.endswith("_shape"):
+                        function_argspec_args = function_argspec_args[:len(
+                            function_argspec_args) - i]
+                        break
                 function_kwargs = {}
                 end_idx = len(function_argspec_args)
                 # convert named arguments
@@ -291,10 +313,9 @@ class Model(fluid.dygraph.Layer):
                                 input_name=arg,
                                 input_idx=None,
                                 is_default=True)
-                    end_idx -= len(function_argspec.defaults)
                 # convert positional arguments
                 function_args = [  # actually we needn't use arg name as var name
-                    self._convert_input(*arg, input_idx=i)
+                    self._convert_input(*arg, input_idx=i + arg_offset)
                     for i, arg in enumerate(
                         zip(args[:end_idx], function_argspec_args[:end_idx]))
                 ]
@@ -308,7 +329,6 @@ class Model(fluid.dygraph.Layer):
                     (var_name, data_extracter(args, kwargs))
                     for var_name, data_extracter in self._inputs.items()
                 ])
-                print("hehehehehe", feed_dict)
                 outputs = self._executor.run(self._main_program,
                                              feed=feed_dict,
                                              fetch_list=None)  #self._outputs
@@ -382,14 +402,14 @@ def eager_guard(is_eager):
 
 with eager_guard(is_eager):
     my_model = MyModel('myfc', 1)
-    print(my_model(
-        np.random.rand(2, 8).astype("float32"),
-        np.random.rand(2, 8).astype("float32")))
+    # print(my_model(
+    #     np.random.rand(2, 8).astype("float32"),
+    #     np.random.rand(2, 8).astype("float32")))
     print(my_model.train(np.random.rand(2, 8).astype("float32"),
-                         np.random.rand(2, 8).astype("float32"),
+                         y=np.random.rand(2, 8).astype("float32"),
                          target=np.random.rand(2, 1).astype("float32")))
     print(my_model.train(np.random.rand(2, 8).astype("float32"),
-                         np.random.rand(2, 8).astype("float32"),
+                         y=np.random.rand(2, 8).astype("float32"),
                          target=np.random.rand(2, 1).astype("float32")))
     print(my_model(
         np.random.rand(2, 8).astype("float32"),
@@ -413,6 +433,7 @@ with eager_guard(is_eager):
 # # print(inspect.getargspec(tmp))
 # print(map_structure(tmp, [1]))
 # print(map_structure(tmp, [1], [1]))
+# print(my_model._data_descs_test)
 exit(0)
 
 
