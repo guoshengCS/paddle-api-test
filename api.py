@@ -1,4 +1,5 @@
 import collections
+import contextlib
 import inspect
 import six
 import sys
@@ -10,6 +11,7 @@ import paddle.fluid.layers.utils as utils
 from paddle.fluid.layers.utils import map_structure, flatten, pack_sequence_as
 from paddle.fluid.dygraph import to_variable
 
+is_eager = False
 
 class Model(fluid.dygraph.Layer):
     """
@@ -17,7 +19,7 @@ class Model(fluid.dygraph.Layer):
     """
     def __init__(self, **kwargs):
         super(Model, self).__init__("model")
-        self._dygraph_mode = False
+        self._dygraph_mode = is_eager
 
         # extract data desc from method arguments
         self._data_descs = {}
@@ -147,19 +149,26 @@ class Model(fluid.dygraph.Layer):
                 self._executor = fluid.Executor(fluid.CPUPlace())
                 self._main_program = fluid.Program()
                 self._startup_program = fluid.Program()
-                self._inputs = []
+                # NOTE: how to run create_parameter multiple times when
+                # build_once would only be called once or parameters are
+                # created in __init__
+                # temporarily, clone parameters form model.parameters to solve
+                # if model has been run, parameters would exist
+                # for param in model_self.parameters():
+                #     self._clone_var(self._main_program, param)
+                # if hasattr(model_self, "optimizer"):
+                #     for param in model_self.optimizer.parameters():
+                #         self._clone_var(self._main_program, param)
+
+                # map var name to how to get corresponding data
+                self._inputs = {}
                 with fluid.program_guard(self._main_program,
                                          self._startup_program):
                     with fluid.unique_name.guard():
                         for function in self._functions:
-                            # print(function)
-                            # print(args)
-                            # print(kwargs)
                             (function_args, function_kwargs, remain_args,
                              remain_kwargs) = self._convert_args(
                                  function, args, kwargs)
-                            # print(function_args)
-                            # print(function_kwargs)
                             function_outs = function(*function_args,
                                                      **function_kwargs)
                             args = list(function_outs if isinstance(
@@ -170,14 +179,25 @@ class Model(fluid.dygraph.Layer):
                 if for_test:
                     self._main_program = self._main_program.clone(for_test=True)
                 # initialization
-                for var in [
-                        var for var in self._startup_program.list_vars()
-                        if hasattr(var, "initializer")
-                ]:
-                    if not fluid.global_scope().find_var(
-                            var.name).get_tensor()._is_initialized():
+                for var in self._startup_program.list_vars():
+                    var_runtime = fluid.global_scope().find_var(var.name)
+                    # NOTE: Do not overwrite loaded parameters, maybe we should
+                    # prune the startup program to only include tue uninitialized
+                    if var_runtime is None or (
+                            not var_runtime.get_tensor()._is_initialized()):
+                        print("run initialization")
                         self._executor.run(self._startup_program)
                         break
+
+            @staticmethod
+            def _clone_var(block, var):
+                assert isinstance(var, Variable)
+                return block.create_var(name=var.name,
+                                        shape=var.shape,
+                                        dtype=var.dtype,
+                                        type=var.type,
+                                        lod_level=var.lod_level,
+                                        persistable=True)
 
             def _convert_input(self,
                                input,
@@ -235,7 +255,6 @@ class Model(fluid.dygraph.Layer):
                 return output
 
             def _convert_args(self, function, args, kwargs):
-                # print(inspect.getcallargs(function, *args, **kwargs))
                 function_argspec = inspect.getargspec(function)
                 function_argspec_args = function_argspec.args
                 if inspect.ismethod(function):
@@ -268,8 +287,9 @@ class Model(fluid.dygraph.Layer):
                     end_idx -= len(function_argspec.defaults)
                 # convert positional arguments
                 function_args = [  # actually we needn't use arg name as var name
-                    self._convert_input(i, *arg) for i, arg in enumerate(
-                        zip(function_argspec_args[:end_idx], args[:end_idx]))
+                    self._convert_input(*arg, input_idx=i)
+                    for i, arg in enumerate(
+                        zip(args[:end_idx], function_argspec_args[:end_idx]))
                 ]
                 return function_args, function_kwargs, args[end_idx:], kwargs
 
@@ -277,13 +297,14 @@ class Model(fluid.dygraph.Layer):
                 # since we only run functions one time to build graph,
                 # assume all run has same arg signature with the first run
                 # TODO: check all run has the same arg signature
-                outputs = self._executor.run(
-                    self._main_program,
-                    feed=dict([
-                        (var_name, data_extracter(args, kwargs))
-                        for var_name, data_extracter in self._inputs.items()
-                    ]),
-                    fetch_list=self._outputs)
+                feed_dict = dict([
+                    (var_name, data_extracter(args, kwargs))
+                    for var_name, data_extracter in self._inputs.items()
+                ])
+                print("hehehehehe", feed_dict)
+                outputs = self._executor.run(self._main_program,
+                                             feed=feed_dict,
+                                             fetch_list=None)  #self._outputs
                 return outputs
 
         if self._dygraph_mode:
@@ -325,10 +346,13 @@ class MyModel(Model):
     def forward(self, x, y, x_shape=[None, 8]):
         # print("x: ", x)
         # print("y: ", y)
-        print("x_shape: ", x_shape)
+        # print("x_shape: ", x_shape)
         x = x + y
+        # fluid.layers.Print(x)
         # print("x+y: ", x)
         x = self.fc(x)
+        # print(self.fc.parameters()[0])
+        # fluid.layers.Print(self.fc.parameters()[0])
         return x
 
     def loss(self, pred, target):
@@ -341,33 +365,44 @@ class MyModel(Model):
         x = optimizer.minimize(loss)
         return x
 
+@contextlib.contextmanager
+def eager_guard(is_eager):
+    if is_eager:
+        with fluid.dygraph.guard():
+            yield
+    else:
+        yield
 
-
-with fluid.dygraph.guard():
+with eager_guard(is_eager):
     my_model = MyModel('myfc', 1)
-    # print(my_model(
-    #     np.random.rand(2, 8).astype("float32"),
-    #     np.random.rand(2, 8).astype("float32")))
     print(my_model.train(np.random.rand(2, 8).astype("float32"),
                          np.random.rand(2, 8).astype("float32"),
                          target=np.random.rand(2, 1).astype("float32")))
+    print(my_model.train(np.random.rand(2, 8).astype("float32"),
+                         np.random.rand(2, 8).astype("float32"),
+                         target=np.random.rand(2, 1).astype("float32")))
+    # print(my_model(
+    #     np.random.rand(2, 8).astype("float32"),
+    #     np.random.rand(2, 8).astype("float32")))
     # fc = fluid.dygraph.FC("test", 1)
+    # print("hehehehehehhe", fc.parameters())
     # pred = fc(to_variable(np.random.rand(2, 8).astype("float32")))
+    # print("hehehehehehhe", fc.parameters())
     # loss = fluid.layers.square_error_cost(
     #     pred,
     #     to_variable(np.random.rand(2, 1).astype("float32")))
     # optimizer = fluid.optimizer.SGD(learning_rate=0.001)
     # x = optimizer.minimize(loss)
     # print(x)
-print(flatten([np.random.rand(2, 3), np.random.rand(2, 3)]))
-print(map_structure(lambda x: x, np.random.rand(2, 3)))
-print(flatten(Model._InputDesc([None, 1,2,3])))
-print(len(flatten(Model._InputDesc([None, 1, 2, 3]))))
+# print(flatten([np.random.rand(2, 3), np.random.rand(2, 3)]))
+# print(map_structure(lambda x: x, np.random.rand(2, 3)))
+# print(flatten(Model._InputDesc([None, 1,2,3])))
+# print(len(flatten(Model._InputDesc([None, 1, 2, 3]))))
 
-def tmp(a, b=1):pass
-# print(inspect.getargspec(tmp))
-print(map_structure(tmp, [1]))
-print(map_structure(tmp, [1], [1]))
+# def tmp(a, b=1):pass
+# # print(inspect.getargspec(tmp))
+# print(map_structure(tmp, [1]))
+# print(map_structure(tmp, [1], [1]))
 exit(0)
 
 
